@@ -358,10 +358,10 @@ class SoundStream(nn.Module):
         multi_spectral_window_powers_of_two = tuple(range(6, 12)),
         multi_spectral_n_ffts = 512,
         multi_spectral_n_mels = 64,
-        recon_loss_weight = 1.,
-        multi_spectral_recon_loss_weight = 1.,
-        adversarial_loss_weight = 1.,
-        feature_loss_weight = 100,
+        recon_loss_weight = 1.,                 #weight
+        multi_spectral_recon_loss_weight = 1.,  #weight
+        adversarial_loss_weight = 1.,           #weight
+        feature_loss_weight = 150,              #weight
         quantize_dropout_cutoff_index = 1,
         target_sample_hz = 24000,
         use_local_attn = True,

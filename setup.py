@@ -24,6 +24,7 @@ setup(
     'ema-pytorch',
     'fairseq',
     'joblib',
+    'numpy==1.23.5',
     'lion-pytorch',
     'local-attention>=1.6.0',
     'Mega-pytorch',
@@ -33,7 +34,7 @@ setup(
     'torchaudio',
     'transformers',
     'tqdm',
-    'vector-quantize-pytorch>=0.10.15'
+    'vector-quantize-pytorch>=1.0.1'
   ],
   classifiers=[
     'Development Status :: 4 - Beta',
