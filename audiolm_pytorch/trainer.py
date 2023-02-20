@@ -118,7 +118,7 @@ class SoundStreamTrainer(nn.Module):
         batch_size,
         data_max_length = None,
         folder,
-        lr = 2e-4,
+        lr = 3e-4,
         grad_accum_every = 4,
         wd = 0.,
         max_grad_norm = 0.5,
@@ -142,7 +142,7 @@ class SoundStreamTrainer(nn.Module):
         super().__init__()
 
         kwargs = DistributedDataParallelKwargs(find_unused_parameters = True)
-        self.accelerator = Accelerator(kwargs_handlers = [kwargs], **accelerate_kwargs)
+        self.accelerator = Accelerator(log_with="tensorboard",logging_dir="tensorboard",kwargs_handlers = [kwargs], **accelerate_kwargs)
 
         self.soundstream = soundstream
 
@@ -324,7 +324,6 @@ class SoundStreamTrainer(nn.Module):
             wave = wave.to(device)
 
             loss, (recon_loss, multi_spectral_recon_loss, adversarial_loss, feature_loss, all_commitment_loss) = self.soundstream(wave, return_loss_breakdown = True)
-
             self.accelerator.backward(loss / self.grad_accum_every)
 
             accum_log(logs, dict(
@@ -403,7 +402,7 @@ class SoundStreamTrainer(nn.Module):
 
         # log
 
-        self.print(losses_str)
+        #self.print(losses_str)
 
         # update exponential moving averaged generator
 
