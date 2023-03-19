@@ -1,9 +1,10 @@
 from setuptools import setup, find_packages
+exec(open('audiolm_pytorch/version.py').read())
 
 setup(
   name = 'audiolm-pytorch',
   packages = find_packages(exclude=[]),
-  version = '0.14.2',
+  version = __version__,
   license='MIT',
   description = 'AudioLM - Language Modeling Approach to Audio Generation from Google Research - Pytorch',
   author = 'Phil Wang',
@@ -26,15 +27,14 @@ setup(
     'joblib',
     'numpy==1.23.5',
     'lion-pytorch',
-    'local-attention>=1.6.0',
-    'Mega-pytorch',
+    'local-attention>=1.8.4',
     'scikit-learn',
     'sentencepiece',
     'torch>=1.12',
     'torchaudio',
     'transformers',
     'tqdm',
-    'vector-quantize-pytorch>=1.0.1'
+    'vector-quantize-pytorch>=1.0.6'
   ],
   classifiers=[
     'Development Status :: 4 - Beta',

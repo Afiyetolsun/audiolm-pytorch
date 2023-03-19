@@ -26,11 +26,13 @@ In the future, <a href="https://www.youtube.com/watch?v=olNvmUCmY8o">this movie 
 
 - <a href="https://github.com/djqualia">@djqualia</a>, <a href="https://github.com/yigityu">@yigityu</a>, <a href="https://github.com/inspirit">@inspirit</a>, and <a href="https://github.com/BlackFox1197">@BlackFox1197</a> for helping with the debugging of soundstream
 
-- <a href="https://github.com/zhvng">Allen</a> for catching and fixing some bugs!
+- <a href="https://github.com/zhvng">Allen</a> and <a href="https://github.com/LWprogramming">LWprogramming</a> for reviewing the code and submitting bug fixes!
 
 - <a href="https://github.com/ilya16">Ilya</a> for finding an issue with multi-scale discriminator downsampling and for soundstream trainer improvements
 
 - <a href="https://github.com/AndreyBocharnikov">Andrey</a> for identifying a missing loss in soundstream and guiding me through the proper mel spectrogram hyperparameters
+
+- <a href="https://github.com/alexdemartos">Alejandro</a> and <a href="https://github.com/ilya16">Ilya</a> for sharing their results with training soundstream, and for working through a few issues with the local attention positional embeddings
 
 ## Install
 
@@ -39,6 +41,8 @@ $ pip install audiolm-pytorch
 ```
 
 ## Usage
+
+### SoundStream
 
 First, `SoundStream` needs to be trained on a large corpus of audio data
 
@@ -57,12 +61,37 @@ trainer = SoundStreamTrainer(
     folder = '/path/to/audio/files',
     batch_size = 4,
     grad_accum_every = 8,         # effective batch size of 32
-    data_max_length = 320 * 32,
-    num_train_steps = 10000
+    data_max_length_seconds = 2,  # train on 2 second audio
+    num_train_steps = 1_000_000
 ).cuda()
 
 trainer.train()
+
+# after a lot of training, you can test the autoencoding as so
+
+audio = torch.randn(10080).cuda()
+recons = soundstream(audio, return_recons_only = True) # (1, 10080) - 1 channel
 ```
+
+You can also use soundstreams that are specific to `AudioLM` and `MusicLM` by importing `AudioLMSoundStream` and `MusicLMSoundStream` respectively
+
+```python
+from audiolm_pytorch import AudioLMSoundStream, MusicLMSoundStream
+
+soundstream = AudioLMSoundStream(...) # say you want the hyperparameters as in Audio LM paper
+
+# rest is the same as above
+```
+
+As of version `0.17.0`, you can now invoke the class method on `SoundStream` to load from checkpoint files, without having to remember your configurations.
+
+```python
+from audiolm_pytorch import SoundStream
+
+soundstream = SoundStream.init_and_load_from('./path/to/checkpoint.pt')
+```
+
+### Hierarchical Transformers
 
 Then three separate transformers (`SemanticTransformer`, `CoarseTransformer`, `FineTransformer`) need to be trained
 
@@ -104,19 +133,14 @@ ex. `CoarseTransformer`
 
 ```python
 import torch
-from audiolm_pytorch import HubertWithKmeans, SoundStream, CoarseTransformer, CoarseTransformerWrapper, CoarseTransformerTrainer
+from audiolm_pytorch import HubertWithKmeans, SoundStream, CoarseTransformer, CoarseTransformerTrainer
 
 wav2vec = HubertWithKmeans(
     checkpoint_path = './hubert/hubert_base_ls960.pt',
     kmeans_path = './hubert/hubert_base_ls960_L9_km500.bin'
 )
 
-soundstream = SoundStream(
-    codebook_size = 1024,
-    rq_num_quantizers = 8,
-)
-
-soundstream.load('/path/to/trained/soundstream.pt')
+soundstream = SoundStream.init_and_load_from('/path/to/trained/soundstream.pt')
 
 coarse_transformer = CoarseTransformer(
     num_semantic_tokens = wav2vec.codebook_size,
@@ -133,7 +157,7 @@ trainer = CoarseTransformerTrainer(
     folder = '/path/to/audio/files',
     batch_size = 1,
     data_max_length = 320 * 32,
-    num_train_steps = 10000
+    num_train_steps = 1_000_000
 )
 
 trainer.train()
@@ -143,14 +167,9 @@ ex. `FineTransformer`
 
 ```python
 import torch
-from audiolm_pytorch import SoundStream, FineTransformer, FineTransformerWrapper, FineTransformerTrainer
+from audiolm_pytorch import SoundStream, FineTransformer, FineTransformerTrainer
 
-soundstream = SoundStream(
-    codebook_size = 1024,
-    rq_num_quantizers = 8,
-)
-
-soundstream.load('/path/to/trained/soundstream.pt')
+soundstream = SoundStream.init_and_load_from('/path/to/trained/soundstream.pt')
 
 fine_transformer = FineTransformer(
     num_coarse_quantizers = 3,
@@ -166,7 +185,7 @@ trainer = FineTransformerTrainer(
     folder = '/path/to/audio/files',
     batch_size = 1,
     data_max_length = 320 * 32,
-    num_train_steps = 10000
+    num_train_steps = 1_000_000
 )
 
 trainer.train()
@@ -251,7 +270,7 @@ trainer = SemanticTransformerTrainer(
     batch_size = 4,
     grad_accum_every = 8,
     data_max_length = 320 * 32,
-    num_train_steps = 100000
+    num_train_steps = 1_000_000
 )
 
 trainer.train()
@@ -310,6 +329,7 @@ $ accelerate launch train.py
 - [ ] cli tool, something like `audiolm generate <wav.file | text>` and save generated wav file to local directory
 - [ ] return a list of waves in the case of variable lengthed audio
 - [ ] just take care of the edge case in coarse transformer text conditioned training, where the raw wave is resampled at different frequencies. autodetermine how to route based on length
+- [ ] allow for specialized relative positional embeddings in fine transformer based on absolute matching positions of quantizers between coarse and fine
 
 ## Citations
 
@@ -434,5 +454,25 @@ $ accelerate launch train.py
     author = {Justin Gilmer, Andrea Schioppa, and Jeremy Cohen},
     year   = {2023},
     status = {to be published - one attention stabilization technique is circulating within Google Brain, being used by multiple teams}
+}
+```
+
+```bibtex
+@article{Defossez2022HighFN,
+    title   = {High Fidelity Neural Audio Compression},
+    author  = {Alexandre D'efossez and Jade Copet and Gabriel Synnaeve and Yossi Adi},
+    journal = {ArXiv},
+    year    = {2022},
+    volume  = {abs/2210.13438}
+}
+```
+
+```bibtex
+@article{Hu2017SqueezeandExcitationN,
+    title   = {Squeeze-and-Excitation Networks},
+    author  = {Jie Hu and Li Shen and Gang Sun},
+    journal = {2018 IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+    year    = {2017},
+    pages   = {7132-7141}
 }
 ```

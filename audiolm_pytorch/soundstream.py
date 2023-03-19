@@ -12,16 +12,22 @@ import torch.nn.functional as F
 from torch.linalg import vector_norm
 
 import torchaudio.transforms as T
+from torchaudio.functional import resample
 
-from einops import rearrange, reduce
+from einops import rearrange, reduce, pack, unpack
 
 from vector_quantize_pytorch import ResidualVQ
 
 from local_attention import LocalMHA
-from local_attention.transformer import FeedForward
+from local_attention.transformer import FeedForward, DynamicPositionBias
 
-from mega_pytorch import MultiHeadedEMA
 from audiolm_pytorch.utils import curtail_to_multiple
+
+from audiolm_pytorch.version import __version__
+from packaging import version
+parsed_version = version.parse(__version__)
+
+import pickle
 
 # helper functions
 
@@ -33,6 +39,12 @@ def default(val, d):
 
 def cast_tuple(t, l = 1):
     return ((t,) * l) if not isinstance(t, tuple) else t
+
+def filter_by_keys(fn, d):
+    return {k: v for k, v in d.items() if fn(k)}
+
+def map_keys(fn, d):
+    return {fn(k): v for k, v in d.items()}
 
 # gan losses
 
@@ -62,6 +74,11 @@ def gradient_penalty(wave, output, weight = 10):
 
     gradients = rearrange(gradients, 'b ... -> b (...)')
     return weight * ((vector_norm(gradients, dim = 1) - 1) ** 2).mean()
+
+# better sequential
+
+def Sequential(*mods):
+    return nn.Sequential(*filter(exists, mods))
 
 # discriminators
 
@@ -112,6 +129,35 @@ class MultiScaleDiscriminator(nn.Module):
 
         return out, intermediates
 
+# autoregressive squeeze excitation
+# https://arxiv.org/abs/1709.01507
+
+class SqueezeExcite(nn.Module):
+    def __init__(self, dim, reduction_factor = 4, dim_minimum = 8):
+        super().__init__()
+        dim_inner = max(dim_minimum, dim // reduction_factor)
+        self.net = nn.Sequential(
+            nn.Conv1d(dim, dim_inner, 1),
+            nn.SiLU(),
+            nn.Conv1d(dim_inner, dim, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        seq, device = x.shape[-2], x.device
+
+        # cumulative mean - since it is autoregressive
+
+        cum_sum = x.cumsum(dim = -2)
+        denom = torch.arange(1, seq + 1, device = device).float()
+        cum_mean = cum_sum / rearrange(denom, 'n -> n 1')
+
+        # glu gate
+
+        gate = self.net(cum_mean)
+
+        return x * gate
+
 # complex stft discriminator
 
 class ModReLU(nn.Module):
@@ -145,6 +191,8 @@ class ComplexConv2d(nn.Module):
 
     def forward(self, x):
         weight, bias = map(torch.view_as_complex, (self.weight, self.bias))
+
+        x = x.to(weight.dtype)
         return F.conv2d(x, weight, bias, stride = self.stride, padding = self.padding)
 
 def ComplexSTFTResidualUnit(chan_in, chan_out, strides):
@@ -168,7 +216,8 @@ class ComplexSTFTDiscriminator(nn.Module):
         n_fft = 1024,
         hop_length = 256,
         win_length = 1024,
-        stft_normalized = False
+        stft_normalized = False,
+        logits_abs = True
     ):
         super().__init__()
         self.init_conv = ComplexConv2d(input_channels, channels, 7, padding = 3)
@@ -193,6 +242,9 @@ class ComplexSTFTDiscriminator(nn.Module):
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.win_length = win_length
+
+        # how to output the logits into real space
+        self.logits_abs = logits_abs
 
     def forward(self, x, return_intermediates = False):
         x = rearrange(x, 'b 1 n -> b n')
@@ -219,6 +271,7 @@ class ComplexSTFTDiscriminator(nn.Module):
         intermediates = []
 
         x = self.init_conv(x)
+
         intermediates.append(x)
 
         for layer in self.layers:
@@ -227,32 +280,15 @@ class ComplexSTFTDiscriminator(nn.Module):
 
         complex_logits = self.final_conv(x)
 
-        complex_logits_abs = torch.abs(complex_logits)
+        if self.logits_abs:
+            complex_logits = complex_logits.abs()
+        else:
+            complex_logits = torch.view_as_real(complex_logits)
 
         if not return_intermediates:
-            return complex_logits_abs
+            return complex_logits
 
-        return complex_logits_abs, intermediates
-
-# learned EMA blocks
-
-class MultiHeadEMABlock(nn.Module):
-    def __init__(
-        self,
-        dim,
-        **kwargs
-    ):
-        super().__init__()
-        self.prenorm = nn.LayerNorm(dim)
-        self.mhema = MultiHeadedEMA(dim = dim, **kwargs)
-
-    def forward(self, x):
-        residual = x.clone()
-        x = rearrange(x, 'b c n -> b n c')
-        x = self.prenorm(x)
-        x = self.mhema(x)
-        x = rearrange(x, 'b n c -> b c n')
-        return x + residual
+        return complex_logits, intermediates
 
 # sound stream
 
@@ -292,50 +328,75 @@ class CausalConvTranspose1d(nn.Module):
 
         return out
 
-def ResidualUnit(chan_in, chan_out, dilation, kernel_size = 7):
-    return Residual(nn.Sequential(
+def ResidualUnit(chan_in, chan_out, dilation, kernel_size = 7, squeeze_excite = False):
+    return Residual(Sequential(
         CausalConv1d(chan_in, chan_out, kernel_size, dilation = dilation),
         nn.ELU(),
         CausalConv1d(chan_out, chan_out, 1),
-        nn.ELU()
+        nn.ELU(),
+        SqueezeExcite(chan_out) if squeeze_excite else None
     ))
 
-def EncoderBlock(chan_in, chan_out, stride, cycle_dilations = (1, 3, 9)):
+def EncoderBlock(chan_in, chan_out, stride, cycle_dilations = (1, 3, 9), squeeze_excite = False):
     it = cycle(cycle_dilations)
+    residual_unit = partial(ResidualUnit, squeeze_excite = squeeze_excite)
+
     return nn.Sequential(
-        ResidualUnit(chan_in, chan_in, next(it)),
-        ResidualUnit(chan_in, chan_in, next(it)),
-        ResidualUnit(chan_in, chan_in, next(it)),
+        residual_unit(chan_in, chan_in, next(it)),
+        residual_unit(chan_in, chan_in, next(it)),
+        residual_unit(chan_in, chan_in, next(it)),
         CausalConv1d(chan_in, chan_out, 2 * stride, stride = stride)
     )
 
-def DecoderBlock(chan_in, chan_out, stride, cycle_dilations = (1, 3, 9)):
+def DecoderBlock(chan_in, chan_out, stride, cycle_dilations = (1, 3, 9), squeeze_excite = False):
     even_stride = (stride % 2 == 0)
     padding = (stride + (0 if even_stride else 1)) // 2
     output_padding = 0 if even_stride else 1
 
+    residual_unit = partial(ResidualUnit, squeeze_excite = squeeze_excite)
+
     it = cycle(cycle_dilations)
     return nn.Sequential(
         CausalConvTranspose1d(chan_in, chan_out, 2 * stride, stride = stride),
-        ResidualUnit(chan_out, chan_out, next(it)),
-        ResidualUnit(chan_out, chan_out, next(it)),
-        ResidualUnit(chan_out, chan_out, next(it)),
+        residual_unit(chan_out, chan_out, next(it)),
+        residual_unit(chan_out, chan_out, next(it)),
+        residual_unit(chan_out, chan_out, next(it)),
     )
 
-class LocalTransformerBlock(nn.Module):
+class LocalTransformer(nn.Module):
     def __init__(
         self,
         *,
         dim,
+        depth,
+        heads,
+        window_size,
+        dynamic_pos_bias = False,
         **kwargs
     ):
         super().__init__()
-        self.attn = LocalMHA(dim = dim, qk_rmsnorm = True, **kwargs)
-        self.ff = FeedForward(dim = dim)
+        self.window_size = window_size
+        self.layers = nn.ModuleList([])
+
+        self.pos_bias = None
+        if dynamic_pos_bias:
+            self.pos_bias = DynamicPositionBias(dim = dim // 2, heads = heads)
+
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                LocalMHA(dim = dim, heads = heads, qk_rmsnorm = True, window_size = window_size, use_rotary_pos_emb = not dynamic_pos_bias, use_xpos = True, **kwargs),
+                FeedForward(dim = dim)
+            ]))
 
     def forward(self, x):
-        x = self.attn(x) + x
-        x = self.ff(x) + x
+        w = self.window_size
+
+        attn_bias = self.pos_bias(w, w * 2) if exists(self.pos_bias) else None
+
+        for attn, ff in self.layers:
+            x = attn(x, attn_bias = attn_bias) + x
+            x = ff(x) + x
+
         return x
 
 class SoundStream(nn.Module):
@@ -350,6 +411,7 @@ class SoundStream(nn.Module):
         rq_num_quantizers = 8,
         rq_commitment_weight = 1.,
         rq_ema_decay = 0.95,
+        rq_quantize_dropout_multiple_of = 1,
         input_channels = 1,
         discr_multi_scales = (1, 0.5, 0.25),
         stft_normalized = False,
@@ -363,17 +425,28 @@ class SoundStream(nn.Module):
         adversarial_loss_weight = 1.,           #weight
         feature_loss_weight = 150,              #weight
         quantize_dropout_cutoff_index = 1,
-        target_sample_hz = 24000,
+        target_sample_hz = 16000,
         use_local_attn = True,
-        use_mhesa = True,
-        mhesa_heads = 4,
-        mhesa_dim_head = 32,
         attn_window_size = 128,
         attn_dim_head = 64,
         attn_heads = 8,
-        attn_depth = 1
+        attn_depth = 1,
+        attn_xpos_scale_base = None,
+        attn_dynamic_pos_bias = False,
+        squeeze_excite = False,
+        complex_stft_discr_logits_abs = True
     ):
         super().__init__()
+
+        # for autosaving the config
+
+        _locals = locals()
+        _locals.pop('self', None)
+        _locals.pop('__class__', None)
+        self._configs = pickle.dumps(_locals)
+
+        # rest of the class
+
         self.target_sample_hz = target_sample_hz # for resampling on the fly
 
         self.single_channel = input_channels == 1
@@ -386,12 +459,7 @@ class SoundStream(nn.Module):
         encoder_blocks = []
 
         for ((chan_in, chan_out), layer_stride) in zip(chan_in_out_pairs, strides):
-            encoder_blocks.append(EncoderBlock(chan_in, chan_out, layer_stride, enc_cycle_dilations))
-
-            if not use_mhesa:
-                continue
-
-            encoder_blocks.append(MultiHeadEMABlock(chan_out, dim_head = mhesa_dim_head, heads = mhesa_heads))
+            encoder_blocks.append(EncoderBlock(chan_in, chan_out, layer_stride, enc_cycle_dilations, squeeze_excite))
 
         self.encoder = nn.Sequential(
             CausalConv1d(input_channels, channels, 7),
@@ -403,12 +471,17 @@ class SoundStream(nn.Module):
             dim = codebook_dim,
             dim_head = attn_dim_head,
             heads = attn_heads,
+            depth = attn_depth,
             window_size = attn_window_size,
+            xpos_scale_base = attn_xpos_scale_base,
+            dynamic_pos_bias = attn_dynamic_pos_bias,
             prenorm = True,
             causal = True
         )
 
-        self.encoder_attn = nn.Sequential(*[LocalTransformerBlock(**attn_kwargs) for _ in range(attn_depth)]) if use_local_attn else None
+        self.encoder_attn = LocalTransformer(**attn_kwargs) if use_local_attn else None
+
+        self.num_quantizers = rq_num_quantizers
 
         self.rq = ResidualVQ(
             dim = codebook_dim,
@@ -416,23 +489,19 @@ class SoundStream(nn.Module):
             codebook_size = codebook_size,
             decay = rq_ema_decay,
             commitment_weight = rq_commitment_weight,
+            quantize_dropout_multiple_of = rq_quantize_dropout_multiple_of,
             kmeans_init = True,
             threshold_ema_dead_code = 2,
             quantize_dropout = True,
             quantize_dropout_cutoff_index = quantize_dropout_cutoff_index
         )
 
-        self.decoder_attn = nn.Sequential(*[LocalTransformerBlock(**attn_kwargs) for _ in range(attn_depth)]) if use_local_attn else None
+        self.decoder_attn = LocalTransformer(**attn_kwargs) if use_local_attn else None
 
         decoder_blocks = []
 
         for ((chan_in, chan_out), layer_stride) in zip(reversed(chan_in_out_pairs), reversed(strides)):
-            decoder_blocks.append(DecoderBlock(chan_out, chan_in, layer_stride, dec_cycle_dilations))
-
-            if not use_mhesa:
-                continue
-
-            decoder_blocks.append(MultiHeadEMABlock(chan_in, dim_head = mhesa_dim_head, heads = mhesa_heads))
+            decoder_blocks.append(DecoderBlock(chan_out, chan_in, layer_stride, dec_cycle_dilations, squeeze_excite))
 
         self.decoder = nn.Sequential(
             CausalConv1d(codebook_dim, layer_channels[-1], 7),
@@ -448,7 +517,8 @@ class SoundStream(nn.Module):
         self.downsamples = nn.ModuleList([nn.Identity()] + [nn.AvgPool1d(2 * factor, stride = factor, padding = factor) for factor in discr_rel_factors])
 
         self.stft_discriminator = ComplexSTFTDiscriminator(
-            stft_normalized = stft_normalized
+            stft_normalized = stft_normalized,
+            logits_abs = complex_stft_discr_logits_abs  # whether to output as abs() or use view_as_real
         )
 
         # multi spectral reconstruction
@@ -487,29 +557,67 @@ class SoundStream(nn.Module):
         self.adversarial_loss_weight = adversarial_loss_weight
         self.feature_loss_weight = feature_loss_weight
 
+        self.register_buffer('zero', torch.tensor([0.]), persistent = False)
+
+    @property
+    def configs(self):
+        return pickle.loads(self._configs)
+
     def decode_from_codebook_indices(self, quantized_indices):
         codes = self.rq.get_codes_from_indices(quantized_indices)
         x = reduce(codes, 'q ... -> ...', 'sum')
 
-        x = self.decoder_attn(x) + x
+        x = self.decoder_attn(x)
         x = rearrange(x, 'b n c -> b c n')
         return self.decoder(x)
 
     def save(self, path):
         path = Path(path)
-        torch.save(self.state_dict(), str(path))
+        pkg = dict(
+            model = self.state_dict(),
+            config = self._configs,
+            version = __version__
+        )
 
-    def load(self, path):
+        torch.save(pkg, str(path))
+
+    @classmethod
+    def init_and_load_from(cls, path, strict = True):
         path = Path(path)
         assert path.exists()
-        self.load_state_dict(torch.load(str(path)))
+        pkg = torch.load(str(path), map_location = 'cpu')
 
-    def load_from_trainer_saved_obj(self, path, ema = False):
-        key = 'ema_model' if ema else 'model'
+        assert 'config' in pkg, 'model configs were not found in this saved checkpoint'
+
+        config = pickle.loads(pkg['config'])
+        soundstream = cls(**config)
+        soundstream.load(path, strict = strict)
+        return soundstream
+
+    def load(self, path, strict = True):
         path = Path(path)
         assert path.exists()
-        trainer_obj = torch.load(str(path))
-        self.load_state_dict(trainer_obj[key])
+        pkg = torch.load(str(path), map_location = 'cpu')
+
+        # check version
+
+        if 'version' in pkg and version.parse(pkg['version']) < parsed_version:
+            print(f'soundstream model being loaded was trained on an older version of audiolm-pytorch ({pkg["version"]})')
+
+        has_ema = 'ema_model' in pkg
+        model_pkg = pkg['ema_model'] if has_ema else pkg['model']
+
+        if has_ema:
+            model_pkg = filter_by_keys(lambda k: k.startswith('ema_model.'), model_pkg)
+            model_pkg = map_keys(lambda k: k[len('ema_model.'):], model_pkg)
+
+        self.load_state_dict(model_pkg, strict = strict)
+
+    def load_from_trainer_saved_obj(self, path):
+        path = Path(path)
+        assert path.exists()
+        obj = torch.load(str(path))
+        self.load_state_dict(obj['model'])
 
     def non_discr_parameters(self):
         return [
@@ -534,6 +642,8 @@ class SoundStream(nn.Module):
         input_sample_hz = None,
         apply_grad_penalty = False
     ):
+        x, ps = pack([x], '* n')
+
         if exists(input_sample_hz):
             x = resample(x, input_sample_hz, self.target_sample_hz)
 
@@ -564,6 +674,7 @@ class SoundStream(nn.Module):
         recon_x = self.decoder(x)
 
         if return_recons_only:
+            recon_x, = unpack(recon_x, ps, '* c n')
             return recon_x
 
         # multi-scale discriminator loss
@@ -628,7 +739,7 @@ class SoundStream(nn.Module):
 
         # multispectral recon loss - eq (4) and (5) in https://arxiv.org/abs/2107.03312
 
-        multi_spectral_recon_loss = 0
+        multi_spectral_recon_loss = self.zero
 
         if self.multi_spectral_recon_loss_weight > 0:
             for mel_transform, alpha in zip(self.mel_spec_transforms, self.mel_spec_recon_alphas):
@@ -689,3 +800,31 @@ class SoundStream(nn.Module):
             return total_loss, (recon_loss, multi_spectral_recon_loss, adversarial_loss, feature_loss, all_commitment_loss)
 
         return total_loss
+
+# some default soundstreams
+
+def AudioLMSoundStream(
+    strides = (2, 4, 5, 8),
+    target_sample_hz = 16000,
+    rq_num_quantizers = 12,
+    **kwargs
+):
+    return SoundStream(
+        strides = strides,
+        target_sample_hz = target_sample_hz,
+        rq_num_quantizers = rq_num_quantizers,
+        **kwargs
+    )
+
+def MusicLMSoundStream(
+    strides = (3, 4, 5, 8),
+    target_sample_hz = 24000,
+    rq_num_quantizers = 12,
+    **kwargs
+):
+    return SoundStream(
+        strides = strides,
+        target_sample_hz = target_sample_hz,
+        rq_num_quantizers = rq_num_quantizers,
+        **kwargs
+    )
